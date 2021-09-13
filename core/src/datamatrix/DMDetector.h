@@ -26,7 +26,8 @@ namespace DataMatrix {
 /**
  * @brief Detects a Data Matrix symbol in an image.
  */
-DetectorResult Detect(const BitMatrix& image, bool tryHarder, bool tryRotate, bool isPure);
+//DetectorResult Detect(const BitMatrix& image, bool tryHarder, bool tryRotate, bool isPure);
+DetectorResult Detect(const BitMatrix& image, bool tryHarder, bool tryRotate, bool isPure, DetectorResult &backup);
 
 } // DataMatrix
 } // ZXing

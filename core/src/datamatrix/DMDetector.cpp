@@ -16,6 +16,9 @@
 * limitations under the License.
 */
 
+//#define PRINT_DEBUG true
+#include "BitMatrixIO.h"
+
 #include "DMDetector.h"
 
 #include "BitMatrix.h"
@@ -39,6 +42,7 @@
 #include <numeric>
 #include <utility>
 #include <vector>
+#include <BitMatrix.cpp>
 
 namespace ZXing::DataMatrix {
 
@@ -580,10 +584,7 @@ public:
 				// make sure we are making progress even when back-projecting:
 				// consider a 90deg corner, rotated 45deg. we step away perpendicular from the line and get
 				// back projected where we left off the line.
-				// The 'while' instead of 'if' was introduced to fix the issue with #245. It turns out that
-				// np can actually be behind the projection of the last line point and we need 2 steps in d
-				// to prevent a dead lock. see #245.png
-				while (distance(np, line.project(line.points().back())) < 1)
+				if (distance(np, line.project(line.points().back())) < 1)
 					np = np + d;
 				p = centered(np);
 			}
@@ -876,15 +877,365 @@ static DetectorResult DetectPure(const BitMatrix& image)
 			{{left, top}, {right, top}, {right, bottom}, {left, bottom}}};
 }
 
-DetectorResult Detect(const BitMatrix& image, bool tryHarder, bool tryRotate, bool isPure)
+
+/* A function for calculating intersection of 4 points*/
+// I expect A and B form a line, then C and D form another line. The intersection shall be AB and CD.
+PointF calculateIntersection(PointF A, PointF B, PointF C, PointF D) {
+	// Calculate both lines
+	double m1 = (B.y - A.y) / (B.x - A.x);
+	double c1 = A.y - m1 * A.x;
+
+	double m2 = (D.y - C.y) / (D.x - C.x);
+	double c2 = C.y - m2 * C.x;
+
+	// Calculate the intersection
+	double x = (c2 - c1) / (m1 - m2);
+	double y = m1 * x + c1;
+
+	return PointF{ x,y };
+}
+
+
+/*
+A new detection algorithm based on the old one.
+Let me try to make use of the zebra pattern on top and right to generate the grid instead of relying solely on
+perspective transform...
+*/
+static DetectorResult SmartScan(EdgeTracer startTracer, std::array<DMRegressionLine, 4>& lines, DetectorResult &backup)
+{
+	while (startTracer.step()) {
+
+		// continue until we cross from black into white
+		if (!startTracer.edgeAtBack().isWhite())
+			continue;
+
+		PointF tl, bl, br, tr;
+		auto& [lineL, lineB, lineR, lineT] = lines;
+
+		for (auto& l : lines)
+			l.reset();
+
+#ifdef PRINT_DEBUG
+		SCOPE_EXIT([&] {
+			for (auto& l : lines)
+				log(l.points());
+			});
+# define CHECK(A) if (!(A)) { printf("broke at %d\n", __LINE__); continue; }
+#else
+# define CHECK(A) if(!(A)) continue
+#endif
+
+		auto t = startTracer;
+
+		// follow left leg upwards
+		t.turnRight();
+		t.state = 1;
+		CHECK(t.traceLine(t.right(), lineL));
+		CHECK(t.traceCorner(t.right(), tl));
+		lineL.reverse();
+		auto tlTracer = t;
+
+		// follow left leg downwards
+		t = startTracer;
+		t.state = 1;
+		t.setDirection(tlTracer.right());
+		CHECK(t.traceLine(t.left(), lineL));
+		if (!lineL.isValid())
+			t.updateDirectionFromOrigin(tl);
+		auto up = t.back();
+		CHECK(t.traceCorner(t.left(), bl));
+
+		// follow bottom leg right
+		t.state = 2;
+		CHECK(t.traceLine(t.left(), lineB));
+		if (!lineB.isValid())
+			t.updateDirectionFromOrigin(bl);
+		auto right = t.front();
+		CHECK(t.traceCorner(t.left(), br));
+
+		auto lenL = distance(tl, bl) - 1;
+		auto lenB = distance(bl, br) - 1;
+		CHECK(lenL >= 8 && lenB >= 10 && lenB >= lenL / 4 && lenB <= lenL * 18);
+
+		auto maxStepSize = static_cast<int>(lenB / 5 + 1); // datamatrix bottom dim is at least 10
+
+		// at this point we found a plausible L-shape and are now looking for the b/w pattern at the top and right:
+		// follow top row right 'half way' (4 gaps), see traceGaps break condition with 'invalid' line
+		tlTracer.setDirection(right);
+		CHECK(tlTracer.traceGaps(tlTracer.right(), lineT, maxStepSize));
+
+		maxStepSize = std::min(lineT.length() / 3, static_cast<int>(lenL / 5)) * 2;
+
+		// follow up until we reach the top line
+		t.setDirection(up);
+		t.state = 3;
+		CHECK(t.traceGaps(t.left(), lineR, maxStepSize, lineT));
+		CHECK(t.traceCorner(t.left(), tr));
+
+		auto lenT = distance(tl, tr) - 1;
+		auto lenR = distance(tr, br) - 1;
+
+		CHECK(std::abs(lenT - lenB) / lenB < 0.5 && std::abs(lenR - lenL) / lenL < 0.5 &&
+			lineT.points().size() >= 5 && lineR.points().size() >= 5);
+
+		// continue top row right until we cross the right line
+		CHECK(tlTracer.traceGaps(tlTracer.right(), lineT, maxStepSize, lineR));
+
+#ifdef PRINT_DEBUG
+		printf("L: %.1f, %.1f ^ %.1f, %.1f > %.1f, %.1f (%d : %d : %d : %d)\n", bl.x, bl.y,
+			tl.x - bl.x, tl.y - bl.y, br.x - bl.x, br.y - bl.y, (int)lenL, (int)lenB, (int)lenT, (int)lenR);
+#endif
+
+		for (auto* l : { &lineL, &lineB, &lineT, &lineR })
+			l->evaluate(1.0);
+
+		// find the bounding box corners of the code with sub-pixel precision by intersecting the 4 border lines
+		// bl stands for bottom left, tr stands for top right, etc.
+		bl = intersect(lineB, lineL);
+		tl = intersect(lineT, lineL);
+		tr = intersect(lineT, lineR);
+		br = intersect(lineB, lineR);
+
+		int dimT, dimR;
+		double fracT, fracR;
+		auto splitDouble = [](double d, int* i, double* f) {
+			*i = std::isnormal(d) ? static_cast<int>(d + 0.5) : 0;
+			*f = std::isnormal(d) ? std::abs(d - *i) : INFINITY;
+		};
+		splitDouble(lineT.modules(tl, tr), &dimT, &fracT);
+		splitDouble(lineR.modules(br, tr), &dimR, &fracR);
+
+#ifdef PRINT_DEBUG
+		printf("L: %.1f, %.1f ^ %.1f, %.1f > %.1f, %.1f ^> %.1f, %.1f\n", bl.x, bl.y,
+			tl.x - bl.x, tl.y - bl.y, br.x - bl.x, br.y - bl.y, tr.x, tr.y);
+		printf("dim: %d x %d\n", dimT, dimR);
+#endif
+
+		// if we have an almost square (invalid rectangular) data matrix dimension, we try to parse it by assuming a
+		// square. we use the dimension that is closer to an integral value. all valid rectangular symbols differ in
+		// their dimension by at least 10 (here 5, see doubling below). Note: this is currently not required for the
+		// black-box tests to complete.
+		if (std::abs(dimT - dimR) < 5)
+			dimT = dimR = fracR < fracT ? dimR : dimT;
+
+		// the dimension is 2x the number of black/white transitions
+		dimT *= 2;
+		dimR *= 2;
+
+		CHECK(dimT >= 10 && dimT <= 144 && dimR >= 8 && dimR <= 144);
+
+		auto movedTowardsBy = [](PointF& a, PointF b1, PointF b2, auto d) {
+			return a + d * normalized(normalized(b1 - a) + normalized(b2 - a));
+		};
+
+		// shrink shape by half a pixel to go from center of white pixel outside of code to the edge between white and black
+		QuadrilateralF sourcePoints = {
+			movedTowardsBy(tl, tr, bl, 0.5f),
+			// move the tr point a little less because the jagged top and right line tend to be statistically slightly
+			// inclined toward the center anyway.
+			movedTowardsBy(tr, br, tl, 0.3f),
+			movedTowardsBy(br, bl, tr, 0.5f),
+			movedTowardsBy(bl, tl, br, 0.5f),
+		};
+
+		auto res = SampleGrid(*startTracer.img, dimT, dimR, PerspectiveTransform(Rectangle(dimT, dimR, 0), sourcePoints));
+
+		// Here I shall fix the issue.
+		// Here we have LineT and LineR which stands for the top line and right line.
+		// They both contain only coordinates of black pixels, so I can make use of this to compute.
+		const BitMatrix &image = *startTracer.img;
+
+#ifdef PRINT_DEBUG
+		LogMatrix mylog;
+		LogMatrixWriter lmw(mylog, image, 5, "mygrid.pnm");
+#endif
+
+		// Get the averages.
+		auto ptsT = lineT.points();
+		auto ptsR = lineR.points();
+		int prev = 0;
+		std::vector<PointF> PointsT = {};
+		std::vector<PointF> PointsR = {};
+		std::vector<PointF> PointsB = {};
+		std::vector<PointF> PointsL = {};
+		PointF myPoint;
+		PointF offset;
+		auto gapSize = lineT.length() / dimT;
+
+		// Add the top right to the vector. And calculate the offset.
+		ptsT.push_back(tr);
+		offset = (gapSize/2) * lineT.normal();
+		for (int curr = 1; curr < ptsT.size(); curr++) {
+			// Sample across the line. Move the pixel a bit downwards
+			if (distance(ptsT[curr-1], ptsT[curr]) > 1.5) {
+				// Get the black pixel.
+				myPoint = (ptsT[curr-1] + ptsT[prev]) / 2 + offset;
+				//mylog(myPoint);
+				PointsT.push_back(myPoint);
+
+				// Get the white pixel
+				myPoint = (ptsT[curr] + ptsT[curr-1]) / 2 + offset;
+				//mylog(myPoint);
+				PointsT.push_back(myPoint);
+				
+				prev = curr;
+			}
+		}
+
+		// Use perspective transform to project PointsT onto lineB to obtain PointsB
+		auto modT2B = PerspectiveTransform(QuadrilateralF{ tl, tr, tr + PointF{1,1}, tl + PointF{1,1} }, QuadrilateralF{ bl,br ,br + PointF{1,1}, bl + PointF{1,1} });
+		for (auto p : PointsT) {
+			myPoint = modT2B(p) - 2 * offset;
+			PointsB.push_back(myPoint);
+			//mylog(myPoint);
+		}
+
+		// Now do the same for lineR. I will refactor this in the future.
+		prev = 0;
+		offset = (gapSize / 2) * lineR.normal();
+		ptsR.push_back(tr);
+		for (int curr = 1; curr < ptsR.size(); curr++) {
+			// Sample across the line. Move the pixel a bit downwards
+			if (distance(ptsR[curr - 1], ptsR[curr]) > 1.5) {
+				// Get the black pixel.
+				myPoint = (ptsR[curr - 1] + ptsR[prev]) / 2 + offset;
+				//mylog(myPoint);
+				PointsR.push_back(myPoint);
+
+				// Get the white pixel
+				myPoint = (ptsR[curr] + ptsR[curr - 1]) / 2 + offset;
+				//mylog(myPoint);
+				PointsR.push_back(myPoint);
+
+				prev = curr;
+			}
+		}
+
+		// Again, Use perspective transform to project PointsR onto lineL to obtain PointsL
+		auto modR2L = PerspectiveTransform(QuadrilateralF{ tr, tr + PointF{1,1}, br + PointF{1,1}, br }, QuadrilateralF{ tl, tl + PointF{1,1}, bl + PointF{1,1}, bl });
+		for (auto p : PointsR) {
+			myPoint = modR2L(p) - 2 * offset;
+			PointsL.push_back(myPoint);
+			//mylog(myPoint);
+		}
+
+		// Now, we calculate the points using PointsB/PointsT, and PointsL/PointsR
+		BitMatrix result(dimT, dimR);
+		PointF cornerTL, cornerTR, cornerBR, cornerBL;
+		for (int i = 0; i < dimT; i++) {
+			for (int j = 0; j < dimR; j++) {
+				myPoint = calculateIntersection(PointsT[i], PointsB[i], PointsR[dimR - j - 1], PointsL[dimR - j - 1]);
+#ifdef PRINT_DEBUG
+				mylog(myPoint, 3);
+#endif
+				if (image.get(myPoint)) {
+					result.set(i, j);
+				}
+
+				// Record the 4 corners
+				if (i == 0 && j == 0) {
+					cornerTL = myPoint;
+				}
+				else if (i == dimT - 1 && j == 0) {
+					cornerTR = myPoint;
+				}
+				else if (i == dimT - 1 && j == dimR - 1) {
+					cornerBR =myPoint;
+				}
+				else if (i == 0 && j == dimR - 1) {
+					cornerBL = myPoint;
+				}
+
+			}
+		}
+
+#ifdef PRINT_DEBUG
+		printf("width: %d, height: %d\n", dimT, dimR);
+		printf("%s", ToString(result).c_str());
+#endif
+
+		// override the result.
+		res = DetectorResult{
+			std::move(result),
+			{cornerTL, cornerTR, cornerBR, cornerBL}
+		};
+
+		backup = DetectorResult{
+			std::move(result),
+			{cornerTL, cornerTR, cornerBR, cornerBL}
+		};
+
+		CHECK(res.isValid());
+
+		return res;
+	}
+
+	return {};
+}
+
+
+static DetectorResult DetectSmart(const BitMatrix& image, bool tryHarder, bool tryRotate, DetectorResult &backup)
+{
+#ifdef PRINT_DEBUG
+	LogMatrixWriter lmw(log, image, 1, "dm-log.pnm");
+#endif
+
+	// disable expensive multi-line scan to detect off-center symbols for now
+	tryHarder = false;
+
+	// a history log to remember where the tracing already passed by to prevent a later trace from doing the same work twice
+	ByteMatrix history;
+	if (tryHarder)
+		history = ByteMatrix(image.width(), image.height());
+
+	// instantiate RegressionLine objects outside of Scan function to prevent repetitive std::vector allocations
+	std::array<DMRegressionLine, 4> lines;
+
+	constexpr int minSymbolSize = 8 * 2; // minimum realistic size in pixel: 8 modules x 2 pixels per module
+
+	for (auto dir : { PointF(-1, 0), PointF(1, 0), PointF(0, -1), PointF(0, 1) }) {
+		auto center = PointF(image.width() / 2, image.height() / 2);
+		auto startPos = centered(center - center * dir + minSymbolSize / 2 * dir);
+
+		EdgeTracer tracer(image, startPos, dir);
+		if (tryHarder) {
+			tracer.history = &history;
+			history.clear();
+		}
+
+		for (int i = 1;; ++i) {
+			tracer.p = startPos + i / 2 * minSymbolSize * (i & 1 ? -1 : 1) * tracer.right();
+
+			if (!tracer.isIn())
+				break;
+
+			if (auto res = SmartScan(tracer, lines, backup); res.isValid())
+				return res;
+
+			if (!tryHarder)
+				break; // only test center lines
+		}
+
+		if (!tryRotate)
+			break; // only test left direction
+	}
+
+	return {};
+}
+
+
+
+DetectorResult Detect(const BitMatrix& image, bool tryHarder, bool tryRotate, bool isPure, DetectorResult &backup)
 {
 	if (isPure)
 		return DetectPure(image);
 
-	auto result = DetectNew(image, tryHarder, tryRotate);
+	//auto result = DetectNew(image, tryHarder, tryRotate);
+	auto result = DetectSmart(image, tryHarder, tryRotate, backup);
 	if (!result.isValid() && tryHarder)
 		result = DetectOld(image);
 	return result;
 }
+
 
 } // namespace ZXing::DataMatrix

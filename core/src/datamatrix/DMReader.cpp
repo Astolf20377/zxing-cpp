@@ -16,7 +16,6 @@
 */
 
 #include "DMReader.h"
-
 #include "BinaryBitmap.h"
 #include "DMDecoder.h"
 #include "DMDetector.h"
@@ -25,6 +24,7 @@
 #include "DetectorResult.h"
 #include "Result.h"
 
+#include <iostream>
 #include <utility>
 
 namespace ZXing::DataMatrix {
@@ -51,12 +51,24 @@ Reader::decode(const BinaryBitmap& image) const
 		return Result(DecodeStatus::NotFound);
 	}
 
-	auto detectorResult = Detect(*binImg, _tryHarder, _tryRotate, _isPure);
+	// Create a backup detectorResult which uses my new detector method. If the original one fails, use this instead.
+	DetectorResult backup;
+
+	auto detectorResult = Detect(*binImg, _tryHarder, _tryRotate, _isPure, backup);
 	if (!detectorResult.isValid())
 		return Result(DecodeStatus::NotFound);
 
-	return Result(Decode(detectorResult.bits(), _characterSet),
+	// Try to obtain the result using the original scanning method. If it does not work, use our method and try again.
+	auto result = Result(Decode(detectorResult.bits(), _characterSet),
 				  std::move(detectorResult).position(), BarcodeFormat::DataMatrix);
+
+	if (result.text().empty() && backup.isValid()) {
+		// do something.
+		return Result(Decode(backup.bits(), _characterSet),
+					std::move(backup).position(), BarcodeFormat::DataMatrix);
+	}
+
+	return result;
 }
 
 } // namespace ZXing::DataMatrix
